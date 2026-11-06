@@ -1,4 +1,5 @@
-
+import queue
+import threading
 import requests
 import re
 import time
@@ -137,7 +138,8 @@ initialize_log()
 
 tg = requests.Session()
 shop = requests.Session()
-
+tg_worker_local = threading.local()
+search_queue = queue.Queue(maxsize=100)
 tg.headers.update({
     "User-Agent": "KetabYabBot/3.0"
 })
@@ -566,8 +568,10 @@ def telegram_call(method, data=None, params=None):
     data = data or {}
     params = params or {}
 
+    telegram_session = getattr(tg_worker_local, "session", tg)
+
     response = request_retry(
-        tg,
+        telegram_session,
         "POST" if data else "GET",
         API + method,
         attempts=3,
@@ -589,8 +593,6 @@ def telegram_call(method, data=None, params=None):
         )
 
     return result
-
-
 def send(chat_id, message):
 
     if not message:
@@ -919,7 +921,56 @@ def search_mehromah(isbn):
 # =========================================
 # 22. USER MESSAGE HANDLER
 # =========================================
+def search_worker():
 
+    tg_worker_local.session = requests.Session()
+    tg_worker_local.session.headers.update({
+        "User-Agent": "KetabYabBot/3.0"
+    })
+
+    print("SEARCH WORKER STARTED", flush=True)
+
+    while True:
+
+        job = search_queue.get()
+
+        try:
+            chat_id, isbn = job
+
+            send(chat_id, "🔎 در حال جستجوی کتاب...")
+
+            answer = search_mehromah(isbn)
+
+            send(chat_id, answer)
+
+        except Exception:
+
+            log_error(
+                "SEARCH WORKER ERROR:\n" +
+                traceback.format_exc()
+            )
+
+            try:
+                send(
+                    chat_id,
+                    "⚠️ جستجوی این کتاب با خطا مواجه شد. ربات فعال است."
+                )
+            except Exception:
+                log_error(traceback.format_exc())
+
+        finally:
+            search_queue.task_done()
+
+
+def start_search_worker():
+
+    worker = threading.Thread(
+        target=search_worker,
+        daemon=True,
+        name="BookSearchWorker"
+    )
+
+    worker.start()
 def handle_message(chat_id, raw_text):
 
     text = digits(raw_text.strip())
@@ -1059,37 +1110,36 @@ def handle_message(chat_id, raw_text):
     publisher = int(publisher)
 
     # MEHROMAH
+        # MEHROMAH
     if publisher == 1:
 
-        send(
-            chat_id,
-            "🔎 در حال جستجو در سایت مهر و ماه..."
-        )
-
         try:
-            answer = search_mehromah(isbn)
-            send(chat_id, answer)
+            search_queue.put_nowait((chat_id, isbn))
+
+            send(
+                chat_id,
+                "📥 بارکد دریافت شد و در صف جستجو قرار گرفت.\n"
+                "می‌توانی بارکد بعدی را هم بفرستی."
+            )
+
+        except queue.Full:
+
+            send(
+                chat_id,
+                "⚠️ صف جستجو پر است. کمی صبر کن."
+            )
 
         except Exception:
 
             log_error(
-                "BOOK SEARCH ERROR:\n" +
-                "ISBN: " + isbn + "\n" +
+                "QUEUE ERROR:\n" +
                 traceback.format_exc()
             )
 
-            try:
-                send(
-                    chat_id,
-                    "⚠️ هنگام جستجوی کتاب خطایی رخ داد.\n\n"
-                    "گزارش خطا ذخیره شد و ربات فعال می‌ماند.\n"
-                    "می‌توانی بارکد بعدی را بفرستی."
-                )
-            except Exception:
-                log_error(
-                    "ERROR SENDING BOOK ERROR MESSAGE:\n" +
-                    traceback.format_exc()
-                )
+            send(
+                chat_id,
+                "خطا در ثبت بارکد."
+            )
 
         return
 
@@ -1188,7 +1238,7 @@ def main():
         )
 
     load_state()
-
+start_search_worker()
     try:
         prepare_polling()
     except Exception:
